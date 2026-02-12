@@ -17,6 +17,7 @@ from .rsna_pipeline import (
     build_embeddings_for_split,
     load_series_records,
     save_split_csv,
+    split_valid_invalid_records,
     split_records_by_study,
     summarize_split,
 )
@@ -44,6 +45,7 @@ class RSNATrainPipelineConfig:
     weight_decay: float
     hidden_dim: int
     dropout: float
+    skip_invalid_nifti: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=TRAIN_DEFAULTS.weight_decay)
     parser.add_argument("--hidden-dim", type=int, default=TRAIN_DEFAULTS.hidden_dim)
     parser.add_argument("--dropout", type=float, default=TRAIN_DEFAULTS.dropout)
+    parser.add_argument(
+        "--skip-invalid-nifti",
+        action="store_true",
+        help="Skip invalid nifti_path records instead of stopping.",
+    )
     return parser
 
 
@@ -97,6 +104,7 @@ def parse_args(argv: list[str] | None = None) -> RSNATrainPipelineConfig:
         weight_decay=args.weight_decay,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        skip_invalid_nifti=args.skip_invalid_nifti,
     )
 
 
@@ -154,6 +162,28 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
     save_split_csv(splits["val"], split_dir / "val.csv", "val")
     save_split_csv(splits["test"], split_dir / "test.csv", "test")
 
+    invalid_report = {}
+    for split_name in ("train", "val", "test"):
+        valid, invalid = split_valid_invalid_records(splits[split_name])
+        if invalid:
+            invalid_report[split_name] = {
+                "count": len(invalid),
+                "examples": invalid[:10],
+            }
+            print(f"[warn] split={split_name} invalid_nifti={len(invalid)}")
+            if not cfg.skip_invalid_nifti:
+                example = invalid[0]
+                raise SystemExit(
+                    "Invalid NIfTI path found before training. "
+                    "Use --skip-invalid-nifti to continue. "
+                    f"Example: split={split_name}, study_uid={example['study_uid']}, "
+                    f"series_uid={example['series_uid']}, resolved={example['resolved_path']}, "
+                    f"reason={example['reason']}"
+                )
+        splits[split_name] = valid
+        if not splits[split_name]:
+            raise SystemExit(f"Split {split_name} has no valid records after filtering.")
+
     print("[pipeline] loading MedDINOv3 backbone once and caching volume embeddings...")
     extractor = MedDINOv3FeatureExtractor(device_override=cfg.device)
     extract_cfg = SliceExtractConfig(
@@ -169,6 +199,7 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
         cache_dir=shared_cache_dir,
         extract_cfg=extract_cfg,
         pool_mode=cfg.pool_mode,
+        skip_invalid_nifti=cfg.skip_invalid_nifti,
     )
     val_x, val_y, _ = build_embeddings_for_split(
         splits["val"],
@@ -176,6 +207,7 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
         cache_dir=shared_cache_dir,
         extract_cfg=extract_cfg,
         pool_mode=cfg.pool_mode,
+        skip_invalid_nifti=cfg.skip_invalid_nifti,
     )
     test_x, test_y, _ = build_embeddings_for_split(
         splits["test"],
@@ -183,6 +215,7 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
         cache_dir=shared_cache_dir,
         extract_cfg=extract_cfg,
         pool_mode=cfg.pool_mode,
+        skip_invalid_nifti=cfg.skip_invalid_nifti,
     )
 
     train_emb, train_lbl = _save_arrays(feature_dir, "train", train_x, train_y)
@@ -235,6 +268,7 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
         },
         "train_summary": train_summary,
         "test_metrics": test_metrics,
+        "invalid_nifti_report": invalid_report,
     }
     (output_dir / "pipeline_summary.json").write_text(json.dumps(pipeline_summary, indent=2))
     return pipeline_summary

@@ -39,11 +39,51 @@ def _to_int01(value: str) -> int:
 
 
 def resolve_nifti_path(path_str: str) -> Path:
-    path = Path(path_str)
+    path = Path(path_str.strip())
     if path.is_absolute():
         return path
     runtime_paths = get_runtime_paths()
     return (runtime_paths.datasets_dir / path_str).resolve()
+
+
+def is_nifti_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    name = path.name.lower()
+    return name.endswith(".nii") or name.endswith(".nii.gz")
+
+
+def validate_record_nifti_path(rec: RSNASeriesRecord) -> tuple[bool, str, Path]:
+    path = resolve_nifti_path(rec.nifti_path)
+    if not path.exists():
+        return False, "path_not_found", path
+    if not path.is_file():
+        return False, "not_a_file", path
+    if not is_nifti_file(path):
+        return False, "not_nifti_file", path
+    return True, "", path
+
+
+def split_valid_invalid_records(
+    records: list[RSNASeriesRecord],
+) -> tuple[list[RSNASeriesRecord], list[dict]]:
+    valid: list[RSNASeriesRecord] = []
+    invalid: list[dict] = []
+    for rec in records:
+        ok, reason, path = validate_record_nifti_path(rec)
+        if ok:
+            valid.append(rec)
+        else:
+            invalid.append(
+                {
+                    "study_uid": rec.study_uid,
+                    "series_uid": rec.series_uid,
+                    "nifti_path": rec.nifti_path,
+                    "resolved_path": str(path),
+                    "reason": reason,
+                }
+            )
+    return valid, invalid
 
 
 def load_series_records(csv_path: str | Path) -> list[RSNASeriesRecord]:
@@ -58,15 +98,19 @@ def load_series_records(csv_path: str | Path) -> list[RSNASeriesRecord]:
         if missing:
             raise ValueError(f"CSV missing required columns: {sorted(missing)}")
         for row in reader:
-            labels = tuple(_to_int01(row[col]) for col in LABEL_COLUMNS)
+            row_clean = {
+                k: (v.strip() if isinstance(v, str) else v)
+                for k, v in row.items()
+            }
+            labels = tuple(_to_int01(row_clean[col]) for col in LABEL_COLUMNS)
             records.append(
                 RSNASeriesRecord(
-                    rel_dir=row["rel_dir"],
-                    study_uid=row["study_uid"],
-                    series_uid=row["series_uid"],
-                    nifti_path=row["nifti_path"],
+                    rel_dir=row_clean["rel_dir"],
+                    study_uid=row_clean["study_uid"],
+                    series_uid=row_clean["series_uid"],
+                    nifti_path=row_clean["nifti_path"],
                     labels=labels,  # type: ignore[arg-type]
-                    raw=dict(row),
+                    raw=dict(row_clean),
                 )
             )
     if not records:
@@ -194,6 +238,7 @@ def build_embeddings_for_split(
     cache_dir: str | Path,
     extract_cfg: SliceExtractConfig,
     pool_mode: str,
+    skip_invalid_nifti: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     cache_root = Path(cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -204,34 +249,46 @@ def build_embeddings_for_split(
 
     total = len(records)
     for idx, rec in enumerate(records, 1):
-        cache_path = cache_root / _cache_key(rec)
-        if cache_path.exists():
-            vol_emb = np.load(cache_path).astype(np.float32)
-            num_slices = None
-        else:
-            nii_path = resolve_nifti_path(rec.nifti_path)
-            if not nii_path.exists():
-                raise FileNotFoundError(f"NIfTI path not found: {nii_path}")
-            slice_emb, _, _ = extractor.extract_slice_embeddings(nii_path, extract_cfg, with_stats=False)
-            vol_emb = aggregate_embeddings(slice_emb, mode=pool_mode).astype(np.float32)
-            np.save(cache_path, vol_emb)
-            num_slices = int(slice_emb.shape[0])
-        emb_list.append(vol_emb)
-        label_list.append(np.asarray(rec.labels, dtype=np.float32))
-        metas.append(
-            {
-                "index": idx,
-                "total": total,
-                "study_uid": rec.study_uid,
-                "series_uid": rec.series_uid,
-                "nifti_path": rec.nifti_path,
-                "cache": str(cache_path),
-                "num_slices": num_slices,
-            }
-        )
+        try:
+            cache_path = cache_root / _cache_key(rec)
+            if cache_path.exists():
+                vol_emb = np.load(cache_path).astype(np.float32)
+                num_slices = None
+            else:
+                ok, reason, nii_path = validate_record_nifti_path(rec)
+                if not ok:
+                    raise ValueError(f"{reason}: {nii_path}")
+                slice_emb, _, _ = extractor.extract_slice_embeddings(nii_path, extract_cfg, with_stats=False)
+                vol_emb = aggregate_embeddings(slice_emb, mode=pool_mode).astype(np.float32)
+                np.save(cache_path, vol_emb)
+                num_slices = int(slice_emb.shape[0])
+            emb_list.append(vol_emb)
+            label_list.append(np.asarray(rec.labels, dtype=np.float32))
+            metas.append(
+                {
+                    "index": idx,
+                    "total": total,
+                    "study_uid": rec.study_uid,
+                    "series_uid": rec.series_uid,
+                    "nifti_path": rec.nifti_path,
+                    "cache": str(cache_path),
+                    "num_slices": num_slices,
+                }
+            )
+        except Exception as exc:
+            err = (
+                f"series failed: study_uid={rec.study_uid}, series_uid={rec.series_uid}, "
+                f"nifti_path={rec.nifti_path}, err={exc}"
+            )
+            if skip_invalid_nifti:
+                print(f"[skip] {err}")
+                continue
+            raise RuntimeError(err) from exc
         if idx % 20 == 0 or idx == total:
             print(f"[cache] {idx}/{total}")
 
+    if not emb_list:
+        raise ValueError("No valid records left after filtering invalid NIfTI paths.")
     x = np.stack(emb_list, axis=0)
     y = np.stack(label_list, axis=0)
     return x, y, metas

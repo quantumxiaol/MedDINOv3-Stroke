@@ -115,7 +115,7 @@ python script/download_models.py --package meddinov3 --check-size
 ## 使用说明
 下面是推荐的完整流程。
 
-### 0) 你现在可以直接跑的命令（服务器）
+### 0) 现在可以直接跑的命令
 ```bash
 cd ~/MedDINOv3-Stroke
 source .venv/bin/activate
@@ -134,6 +134,7 @@ python script/train_meddinov3_rsna.py \
   --pool-mode mean \
   --batch 8 --resize 224 \
   --epochs 30 --train-batch-size 64 \
+  --skip-invalid-nifti \
   --device gpu
 ```
 
@@ -223,7 +224,8 @@ python script/train_meddinov3_rsna.py \
   --train-ratio 0.7 --val-ratio 0.15 --test-ratio 0.15 \
   --pool-mode mean \
   --batch 8 --resize 224 \
-  --epochs 30 --train-batch-size 64
+  --epochs 30 --train-batch-size 64 \
+  --skip-invalid-nifti
 ```
 
 输出：
@@ -232,6 +234,11 @@ python script/train_meddinov3_rsna.py \
 - `checkpoints/rsna_ich_head/best.pt`, `last.pt`
 - `outputs/rsna_pipeline/test_metrics.json`
 - `outputs/rsna_pipeline/pipeline_summary.json`
+
+如果出现 `Cannot work out file type of "/data/datasets"` 之类错误：
+- 说明 CSV 的某些 `nifti_path` 不是 `.nii/.nii.gz` 文件（可能是目录或坏路径）。
+- 使用 `--skip-invalid-nifti` 可以跳过坏样本继续训练。
+- 训练摘要里的 `invalid_nifti_report` 会记录坏样本统计和示例。
 
 如果只想先划分数据：
 ```bash
