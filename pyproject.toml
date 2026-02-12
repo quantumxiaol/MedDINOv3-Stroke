@@ -1,0 +1,28 @@
+[project]
+name = "meddinov3-stroke"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "nibabel>=5.3.0",
+    "nnunetv2",
+    "pytest>=9.0.2",
+    "python-dotenv==1.2.1",
+]
+
+[tool.uv.sources]
+
+nnunetv2 = { path = "third_party/MedDINOv3/nnUNet", editable = true }
+
+
+[tool.setuptools.packages.find]
+where = ["src"] 
+
+[tool.setuptools.package-dir]
+"" = "src" 
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
