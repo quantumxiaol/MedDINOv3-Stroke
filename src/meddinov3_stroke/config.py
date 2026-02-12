@@ -50,7 +50,7 @@ class InferDefaults:
 
 @dataclass(frozen=True)
 class TrainDefaults:
-    output_dir: str = "outputs/head_train"
+    output_dir: str = "checkpoints/head_train"
     epochs: int = 20
     batch_size: int = 64
     lr: float = 1e-3
@@ -96,4 +96,3 @@ def get_runtime_sources() -> RuntimeSources:
         dino_url=_env_str("DINOV3_URL"),
         hf_mirror=_env_str("HF_MIRROR"),
     )
-

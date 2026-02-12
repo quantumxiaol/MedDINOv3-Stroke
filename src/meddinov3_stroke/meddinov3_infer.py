@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .config import INFER_DEFAULTS, get_runtime_paths
-from .infer_utils import find_input_nii, load_env, measure_inference, print_stats, select_device
+from .config import INFER_DEFAULTS
+from .feature_extractor import MedDINOv3FeatureExtractor, SliceExtractConfig, load_volume_zyx
+from .infer_utils import find_input_nii, load_env, print_stats
 
 
 @dataclass
@@ -66,122 +66,30 @@ def _validate_args(cfg: MedDinoInferConfig) -> None:
         raise SystemExit("--max-slices must be >= 0")
 
 
-def _ensure_dinov3_import_path(repo_root: Path) -> None:
-    dinov3_parent = (
-        repo_root
-        / "third_party"
-        / "MedDINOv3"
-        / "nnUNet"
-        / "nnunetv2"
-        / "training"
-        / "nnUNetTrainer"
-        / "dinov3"
-    )
-    if str(dinov3_parent) not in sys.path:
-        sys.path.insert(0, str(dinov3_parent))
-
-
-def _load_volume(input_path: Path) -> np.ndarray:
-    import nibabel as nib
-
-    img = nib.load(str(input_path)).get_fdata()
-    if img.ndim == 4:
-        img = img[..., 0]
-    img = np.asarray(img, dtype=np.float32)
-    if img.ndim != 3:
-        raise SystemExit(f"Unexpected input shape: {img.shape}")
-    return np.transpose(img, (2, 0, 1))  # D, H, W
-
-
-def _select_indices(depth: int, stride: int, max_slices: int) -> list[int]:
-    indices = list(range(0, depth, stride))
-    if max_slices and len(indices) > max_slices:
-        indices = indices[:max_slices]
-    if not indices:
-        raise SystemExit(
-            f"No slices selected from volume depth={depth}. "
-            "Check --stride/--max-slices configuration."
-        )
-    return indices
-
-
 def run_meddinov3_inference(cfg: MedDinoInferConfig) -> dict:
     load_env()
-    if cfg.device:
-        os.environ["CT_MODEL_DEVICE"] = cfg.device
     _validate_args(cfg)
-
-    paths = get_runtime_paths()
-    ckpt_path = paths.meddinov3_ckpt_path
-    if not ckpt_path.exists():
-        raise SystemExit(f"MedDINOv3 weights not found: {ckpt_path}")
-
-    repo_root = Path(__file__).resolve().parents[2]
-    _ensure_dinov3_import_path(repo_root)
-
-    from dinov3.models.vision_transformer import vit_base
-    import torch
 
     input_path = Path(cfg.input_path).expanduser().resolve() if cfg.input_path else find_input_nii()
     if not input_path.exists():
         raise SystemExit(f"Input file not found: {input_path}")
-
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    img = _load_volume(input_path)
-    indices = _select_indices(depth=img.shape[0], stride=cfg.stride, max_slices=cfg.max_slices)
-
-    device, _ = select_device(torch)
-
-    model = vit_base(
-        drop_path_rate=0.2,
-        layerscale_init=1.0e-05,
-        n_storage_tokens=4,
-        qkv_bias=False,
-        mask_k_bias=True,
+    extractor = MedDINOv3FeatureExtractor(device_override=cfg.device)
+    extract_cfg = SliceExtractConfig(
+        stride=cfg.stride,
+        max_slices=cfg.max_slices,
+        batch_size=cfg.batch,
+        resize=cfg.resize,
     )
-    chkpt = torch.load(str(ckpt_path), weights_only=False, map_location="cpu")
-    state = chkpt.get("teacher", chkpt)
-    if not isinstance(state, dict):
-        raise SystemExit("Unexpected MedDINOv3 checkpoint format.")
-    state = {
-        k.replace("backbone.", ""): v
-        for k, v in state.items()
-        if "ibot" not in k and "dino_head" not in k
-    }
-    model.load_state_dict(state, strict=False)
-    model.to(device)
-    model.eval()
+    volume = load_volume_zyx(input_path)
+    emb, indices, stats = extractor.extract_slice_embeddings_from_volume(volume, extract_cfg, with_stats=True)
+    print_stats("meddinov3_vitb16", stats or {})
 
-    mean = 65.1084213256836
-    std = 178.01663208007812
-
-    def preprocess_slices(batch: np.ndarray) -> torch.Tensor:
-        x = torch.from_numpy(batch)[:, None, ...]
-        x = torch.clamp(x, min=-1000, max=1000)
-        x = (x - mean) / (std + 1e-8)
-        x = x.repeat(1, 3, 1, 1)
-        x = torch.nn.functional.interpolate(x, size=(cfg.resize, cfg.resize), mode="bilinear", align_corners=False)
-        return x
-
-    def _run():
-        embeddings = []
-        with torch.inference_mode():
-            for i in range(0, len(indices), cfg.batch):
-                batch_idx = indices[i : i + cfg.batch]
-                batch = np.stack([img[j] for j in batch_idx], axis=0)
-                feats = model.forward_features(preprocess_slices(batch).to(device))
-                embeddings.append(feats["x_norm_clstoken"].detach().cpu())
-        return torch.cat(embeddings, dim=0)
-
-    stats = measure_inference(torch, device, _run)
-    print_stats("meddinov3_vitb16", stats)
-
-    emb = stats["result"]
-    np.save(output_dir / "meddinov3_slice_embeddings.npy", emb.numpy())
+    np.save(output_dir / "meddinov3_slice_embeddings.npy", emb)
     np.save(output_dir / "slice_indices.npy", np.asarray(indices, dtype=np.int32))
-    np.save(output_dir / "embedding_mean.npy", emb.mean(dim=0).numpy())
+    np.save(output_dir / "embedding_mean.npy", emb.mean(axis=0))
 
     summary = {
         "input": str(input_path),
@@ -190,52 +98,26 @@ def run_meddinov3_inference(cfg: MedDinoInferConfig) -> dict:
         "stride": int(cfg.stride),
         "resize": int(cfg.resize),
         "embedding_dim": int(emb.shape[1]),
-        "elapsed_s": stats.get("elapsed_s"),
-        "gpu_mem_mb": stats.get("gpu_mem_mb"),
-        "cpu_rss_mb": stats.get("cpu_rss_mb"),
+        "elapsed_s": None if stats is None else stats.get("elapsed_s"),
+        "gpu_mem_mb": None if stats is None else stats.get("gpu_mem_mb"),
+        "cpu_rss_mb": None if stats is None else stats.get("cpu_rss_mb"),
         "similarity_map": None,
         "similarity_slice_index": None,
     }
 
     sim_slice = cfg.sim_slice if cfg.sim_slice >= 0 else indices[len(indices) // 2]
-    if 0 <= sim_slice < img.shape[0]:
-        slice_img = img[sim_slice]
-        with torch.inference_mode():
-            feats = model.forward_features(preprocess_slices(slice_img[None, ...]).to(device))
-            patch_tokens = feats["x_norm_patchtokens"].detach().cpu()[0]
-        patch_size = getattr(model, "patch_size", 16)
-        if isinstance(patch_size, tuple):
-            patch_size = patch_size[0]
-        h = cfg.resize // patch_size
-        w = cfg.resize // patch_size
-        if patch_tokens.shape[0] == h * w:
-            patch_tokens_2d = patch_tokens.reshape(h, w, -1)
-            if cfg.sim_patch == "center":
-                ph, pw = h // 2, w // 2
-            else:
-                try:
-                    ph, pw = (int(coord) for coord in cfg.sim_patch.split(","))
-                except Exception:
-                    ph, pw = h // 2, w // 2
-            ph = max(0, min(h - 1, ph))
-            pw = max(0, min(w - 1, pw))
-            ref = patch_tokens_2d[ph, pw]
-            sim = torch.nn.functional.cosine_similarity(
-                patch_tokens_2d.reshape(-1, patch_tokens_2d.shape[-1]),
-                ref[None, :].repeat(h * w, 1),
-                dim=1,
-            ).reshape(h, w)
-            sim_np = sim.numpy()
-            np.save(output_dir / "similarity_map.npy", sim_np)
-            summary["similarity_map"] = str(output_dir / "similarity_map.npy")
-            summary["similarity_slice_index"] = int(sim_slice)
-            try:
-                import matplotlib.pyplot as plt
+    sim_np = extractor.similarity_map_from_volume(volume, sim_slice, resize=cfg.resize, sim_patch=cfg.sim_patch)
+    if sim_np is not None:
+        np.save(output_dir / "similarity_map.npy", sim_np)
+        summary["similarity_map"] = str(output_dir / "similarity_map.npy")
+        summary["similarity_slice_index"] = int(sim_slice)
+        try:
+            import matplotlib.pyplot as plt
 
-                plt.imsave(output_dir / "similarity_map.png", sim_np, cmap="viridis")
-                summary["similarity_map_png"] = str(output_dir / "similarity_map.png")
-            except Exception:
-                pass
+            plt.imsave(output_dir / "similarity_map.png", sim_np, cmap="viridis")
+            summary["similarity_map_png"] = str(output_dir / "similarity_map.png")
+        except Exception:
+            pass
 
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
@@ -246,3 +128,4 @@ def main(argv: list[str] | None = None) -> int:
     cfg = parse_args(argv)
     run_meddinov3_inference(cfg)
     return 0
+
