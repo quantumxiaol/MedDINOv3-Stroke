@@ -208,6 +208,14 @@ def run_ich_inference(cfg: ICHInferConfig) -> dict:
     np.save(output_dir / "slice_embeddings.npy", slice_emb.astype(np.float32))
     np.save(output_dir / "volume_embedding.npy", vol_emb.astype(np.float32))
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    # Print concise clinical-facing inference summary to stdout.
+    pretty_probs = {k: round(v, 4) for k, v in probs.items()}
+    print("[ich] probabilities:", json.dumps(pretty_probs, ensure_ascii=False))
+    print("[ich] predicted:", json.dumps(pred, ensure_ascii=False))
+    if top_slices:
+        print(f"[ich] top suspicious slice: {top_slices[0]}")
+    print(f"[ich] summary saved: {output_dir / 'summary.json'}")
     return summary
 
 
@@ -216,4 +224,3 @@ def main(argv: list[str] | None = None) -> int:
     cfg = parse_args(argv)
     run_ich_inference(cfg)
     return 0
-
