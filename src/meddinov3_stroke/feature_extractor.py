@@ -143,6 +143,12 @@ class MedDINOv3FeatureExtractor:
         x = self.torch.nn.functional.interpolate(x, size=(resize, resize), mode="bilinear", align_corners=False)
         return x
 
+    def preprocess_slice(self, slice_hw: np.ndarray, resize: int):
+        slice_arr = np.asarray(slice_hw, dtype=np.float32)
+        if slice_arr.ndim != 2:
+            raise ValueError(f"Expected 2D slice [H, W], got {slice_arr.shape}")
+        return self._preprocess_batch(slice_arr[None, ...], resize)
+
     def extract_slice_embeddings_from_volume(
         self,
         volume_zyx: np.ndarray,
@@ -220,4 +226,3 @@ class MedDINOv3FeatureExtractor:
             dim=1,
         ).reshape(h, w)
         return sim.numpy().astype(np.float32)
-

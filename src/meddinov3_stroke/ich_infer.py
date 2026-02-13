@@ -107,6 +107,57 @@ def _load_head(ckpt_path: Path, torch_module, device):
     return model, ckpt, input_dim, num_classes
 
 
+def _slice_embeddings_to_head_input(slice_emb: np.ndarray, pool_mode: str) -> np.ndarray:
+    if pool_mode == "mean":
+        return slice_emb
+    if pool_mode == "meanmax":
+        return np.concatenate([slice_emb, slice_emb], axis=1)
+    raise ValueError(f"Unsupported pool mode: {pool_mode}")
+
+
+def _single_cls_to_head_input(cls_token, pool_mode: str, torch_module):
+    if pool_mode == "mean":
+        return cls_token
+    if pool_mode == "meanmax":
+        return torch_module.cat([cls_token, cls_token], dim=1)
+    raise ValueError(f"Unsupported pool mode: {pool_mode}")
+
+
+def _resize_slice_for_overlay(slice_hw: np.ndarray, resize: int, torch_module) -> np.ndarray:
+    raw = torch_module.from_numpy(np.asarray(slice_hw, dtype=np.float32))[None, None, ...]
+    raw = torch_module.nn.functional.interpolate(raw, size=(resize, resize), mode="bilinear", align_corners=False)[0, 0]
+    raw = torch_module.clamp(raw, min=-1000, max=1000)
+    raw = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
+    return raw.detach().cpu().numpy()
+
+
+def _compute_any_saliency_map(
+    extractor: MedDINOv3FeatureExtractor,
+    head_model,
+    slice_hw: np.ndarray,
+    resize: int,
+    pool_mode: str,
+) -> np.ndarray:
+    torch = extractor.torch
+    x = extractor.preprocess_slice(slice_hw, resize).to(extractor.device)
+    x.requires_grad_(True)
+
+    extractor.model.zero_grad(set_to_none=True)
+    head_model.zero_grad(set_to_none=True)
+
+    feats = extractor.model.forward_features(x)
+    cls_token = feats["x_norm_clstoken"]
+    head_in = _single_cls_to_head_input(cls_token, pool_mode, torch_module=torch)
+    any_logit = head_model(head_in)[0, 0]
+    any_logit.backward()
+
+    if x.grad is None:
+        raise RuntimeError("Failed to compute saliency gradient.")
+    sal = x.grad.detach()[0].abs().mean(dim=0)
+    sal = sal / (sal.max() + 1e-8)
+    return sal.detach().cpu().numpy().astype(np.float32)
+
+
 def run_ich_inference(cfg: ICHInferConfig) -> dict:
     load_env()
     _validate(cfg)
@@ -145,32 +196,63 @@ def run_ich_inference(cfg: ICHInferConfig) -> dict:
     probs = {name: float(vol_probs[i]) for i, name in enumerate(LABEL_NAMES)}
     pred = {name: bool(vol_probs[i] >= cfg.threshold) for i, name in enumerate(LABEL_NAMES)}
 
+    sl_head_in = _slice_embeddings_to_head_input(slice_emb, pool_mode=pool_mode)
+    with torch.inference_mode():
+        sl_logits = model(torch.from_numpy(sl_head_in).to(extractor.device))
+        sl_probs = torch.sigmoid(sl_logits).detach().cpu().numpy()
+    np.save(output_dir / "slice_probs.npy", sl_probs.astype(np.float32))
+    any_probs = sl_probs[:, 0]
     top_slices: list[dict] = []
-    if input_dim == slice_emb.shape[1]:
-        with torch.inference_mode():
-            sl_logits = model(torch.from_numpy(slice_emb).to(extractor.device))
-            sl_probs = torch.sigmoid(sl_logits).detach().cpu().numpy()
-        any_probs = sl_probs[:, 0]
-        top_k = min(cfg.top_k, len(any_probs))
-        top_idx = np.argsort(any_probs)[-top_k:][::-1]
-        for idx in top_idx:
-            top_slices.append(
-                {
-                    "rank": int(len(top_slices) + 1),
-                    "slice_pos": int(idx),
-                    "slice_index": int(slice_indices[idx]),
-                    "p_any": float(any_probs[idx]),
-                }
-            )
-        np.save(output_dir / "slice_probs.npy", sl_probs.astype(np.float32))
+    top_k = min(cfg.top_k, len(any_probs))
+    top_idx = np.argsort(any_probs)[-top_k:][::-1]
+    for idx in top_idx:
+        top_slices.append(
+            {
+                "rank": int(len(top_slices) + 1),
+                "slice_pos": int(idx),
+                "slice_index": int(slice_indices[idx]),
+                "p_any": float(any_probs[idx]),
+            }
+        )
 
     if cfg.sim_slice >= 0:
-        sim_slice = cfg.sim_slice
+        lesion_slice = cfg.sim_slice
     elif top_slices:
-        sim_slice = int(top_slices[0]["slice_index"])
+        lesion_slice = int(top_slices[0]["slice_index"])
     else:
-        sim_slice = int(slice_indices[len(slice_indices) // 2])
-    sim_np = extractor.similarity_map_from_volume(volume, sim_slice, resize=cfg.resize, sim_patch=cfg.sim_patch)
+        lesion_slice = int(slice_indices[len(slice_indices) // 2])
+
+    lesion_map = _compute_any_saliency_map(
+        extractor=extractor,
+        head_model=model,
+        slice_hw=volume[lesion_slice],
+        resize=cfg.resize,
+        pool_mode=pool_mode,
+    )
+    lesion_heatmap = str(output_dir / "lesion_heatmap.npy")
+    np.save(lesion_heatmap, lesion_map.astype(np.float32))
+
+    lesion_heatmap_png = None
+    lesion_overlay_png = None
+    try:
+        import matplotlib.pyplot as plt
+
+        lesion_heatmap_png = str(output_dir / "lesion_heatmap.png")
+        plt.imsave(lesion_heatmap_png, lesion_map, cmap="jet")
+
+        base = _resize_slice_for_overlay(volume[lesion_slice], cfg.resize, torch_module=torch)
+        lesion_overlay_png = str(output_dir / "lesion_overlay.png")
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.imshow(base, cmap="gray")
+        ax.imshow(lesion_map, cmap="jet", alpha=0.4)
+        ax.axis("off")
+        fig.savefig(lesion_overlay_png, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+    except Exception:
+        lesion_heatmap_png = None
+        lesion_overlay_png = None
+
+    sim_np = extractor.similarity_map_from_volume(volume, lesion_slice, resize=cfg.resize, sim_patch=cfg.sim_patch)
 
     similarity_map = None
     similarity_png = None
@@ -196,7 +278,11 @@ def run_ich_inference(cfg: ICHInferConfig) -> dict:
         "predicted": pred,
         "threshold": float(cfg.threshold),
         "top_slices": top_slices,
-        "similarity_slice_index": int(sim_slice),
+        "lesion_slice_index": int(lesion_slice),
+        "lesion_heatmap": lesion_heatmap,
+        "lesion_heatmap_png": lesion_heatmap_png,
+        "lesion_overlay_png": lesion_overlay_png,
+        "similarity_slice_index": int(lesion_slice),
         "similarity_map": similarity_map,
         "similarity_map_png": similarity_png,
         "elapsed_s": None if stats is None else stats.get("elapsed_s"),
@@ -215,6 +301,7 @@ def run_ich_inference(cfg: ICHInferConfig) -> dict:
     print("[ich] predicted:", json.dumps(pred, ensure_ascii=False))
     if top_slices:
         print(f"[ich] top suspicious slice: {top_slices[0]}")
+    print(f"[ich] lesion heatmap: {output_dir / 'lesion_overlay.png'}")
     print(f"[ich] summary saved: {output_dir / 'summary.json'}")
     return summary
 

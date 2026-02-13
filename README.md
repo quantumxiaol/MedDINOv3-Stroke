@@ -16,13 +16,13 @@
 4. 单通道复制为 3 通道以适配 ViT 输入
 5. `vit_base(...).forward_features(...)` 提取：
    - `x_norm_clstoken`：每张切片一个 `D=768` 向量
-   - `x_norm_patchtokens`：用于可视化 patch 相似度热图
+   - `x_norm_patchtokens`：用于辅助可视化 patch 相似度图（非病灶概率图）
 
 输出：
 - `meddinov3_slice_embeddings.npy` (`[N, 768]`)
 - `slice_indices.npy`
 - `embedding_mean.npy`
-- `similarity_map.npy/.png`（示例切片）
+- `similarity_map.npy/.png`（示例切片 patch 相似度，仅辅助）
 
 ### 阶段 B：轻量分类头训练与评估
 训练输入：预提取 embedding 与标签（`npy`）
@@ -261,13 +261,17 @@ python script/infer_meddinov3_ich.py \
 
 输出：
 - `summary.json`：6 类概率、阈值判定、Top-K 可疑切片
-- `similarity_map.png`：可疑切片 patch 相似度热图
+- `lesion_overlay.png`：可疑切片的病灶定位热图叠加图（优先看这个）
+- `lesion_heatmap.png`：病灶定位热图（不带 CT 底图）
+- `similarity_map.png`：patch 相似度图（辅助，不等价于病灶图）
 - `slice_probs.npy`（当 head 输入维度与 slice embedding 一致时）
 
 ## 结果文件说明
 推理阶段：
 - `summary.json`：输入、切片数、embedding 维度、耗时、显存/内存统计
-- `similarity_map.npy/.png`：示例切片 patch 级相似度图
+- `lesion_heatmap.npy/.png`：基于 `any` logit 梯度的切片级病灶热图
+- `lesion_overlay.png`：病灶热图叠加到 CT 切片的可视化
+- `similarity_map.npy/.png`：示例切片 patch 相似度图（辅助解释）
 
 训练阶段：
 - `train_summary.json`：配置、训练历史、最佳指标和 checkpoint 路径
@@ -280,4 +284,4 @@ python script/infer_meddinov3_ich.py \
 
 ## 备注
 - 当前仓库以“冻结 backbone + 简单头”的 baseline 为主，便于快速迭代。
-- 若后续需要病例级 MIL、Top-K slice 聚合、Grad-CAM/attention rollout，可在现有结构上扩展。
+- 当前已支持输出病例级 Top-K 可疑切片和切片级病灶热图，后续可继续扩展到 MIL 聚合。
