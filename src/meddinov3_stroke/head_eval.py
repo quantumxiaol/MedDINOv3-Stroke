@@ -22,6 +22,17 @@ class EvalConfig:
     device: str
     output_json: str
     output_probs: str
+    threshold: float = 0.5
+
+
+DEFAULT_LABEL_NAMES = (
+    "any",
+    "epidural",
+    "intraparenchymal",
+    "intraventricular",
+    "subarachnoid",
+    "subdural",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint file, usually best.pt.")
     parser.add_argument("--batch-size", type=int, default=EVAL_DEFAULTS.batch_size)
     parser.add_argument("--device", type=str, default=os.getenv("CT_MODEL_DEVICE", EVAL_DEFAULTS.device))
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binary decision threshold for prob > threshold.")
     parser.add_argument("--output-json", type=str, default="", help="Optional metrics output JSON path.")
     parser.add_argument("--output-probs", type=str, default="", help="Optional probabilities .npy output path.")
     return parser
@@ -46,7 +58,49 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
         device=args.device,
         output_json=args.output_json,
         output_probs=args.output_probs,
+        threshold=args.threshold,
     )
+
+
+def _safe_div(num: float, den: float) -> float:
+    if den <= 0:
+        return float("nan")
+    return float(num / den)
+
+
+def _binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_pred = np.asarray(y_pred, dtype=np.int32)
+    tp = int(np.logical_and(y_true == 1, y_pred == 1).sum())
+    tn = int(np.logical_and(y_true == 0, y_pred == 0).sum())
+    fp = int(np.logical_and(y_true == 0, y_pred == 1).sum())
+    fn = int(np.logical_and(y_true == 1, y_pred == 0).sum())
+
+    accuracy = _safe_div(tp + tn, tp + tn + fp + fn)
+    precision = _safe_div(tp, tp + fp)
+    sensitivity = _safe_div(tp, tp + fn)
+    if np.isfinite(precision) and np.isfinite(sensitivity) and (precision + sensitivity) > 0:
+        f1 = float(2 * precision * sensitivity / (precision + sensitivity))
+    else:
+        f1 = float("nan")
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "f1": f1,
+        "sensitivity": sensitivity,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
+def _macro_metric(per_class: list[dict], key: str) -> float:
+    values = [float(m[key]) for m in per_class if np.isfinite(m[key])]
+    if not values:
+        return float("nan")
+    return float(np.mean(values))
 
 
 def evaluate_head(cfg: EvalConfig) -> dict:
@@ -55,6 +109,8 @@ def evaluate_head(cfg: EvalConfig) -> dict:
         os.environ["CT_MODEL_DEVICE"] = cfg.device
     if cfg.batch_size <= 0:
         raise SystemExit("--batch-size must be > 0")
+    if not (0.0 <= cfg.threshold <= 1.0):
+        raise SystemExit("--threshold must be in [0, 1]")
 
     import torch
 
@@ -114,6 +170,21 @@ def evaluate_head(cfg: EvalConfig) -> dict:
             all_probs.append(torch.sigmoid(logits).detach().cpu().numpy())
     probs = np.concatenate(all_probs, axis=0)
     auc = multilabel_auroc(y, probs)
+    y_true_bin = (y > 0.5).astype(np.int32)
+    y_pred_bin = (probs > cfg.threshold).astype(np.int32)
+
+    class_names = list(DEFAULT_LABEL_NAMES[: y.shape[1]])
+    if len(class_names) < y.shape[1]:
+        class_names.extend([f"class_{i}" for i in range(len(class_names), y.shape[1])])
+
+    per_class_cls = []
+    for i in range(y.shape[1]):
+        cls_metrics = _binary_metrics(y_true_bin[:, i], y_pred_bin[:, i])
+        cls_metrics["class_index"] = int(i)
+        cls_metrics["class_name"] = class_names[i]
+        per_class_cls.append(cls_metrics)
+
+    any_metrics = per_class_cls[0] if per_class_cls else None
 
     metrics = {
         "config": asdict(cfg),
@@ -121,14 +192,30 @@ def evaluate_head(cfg: EvalConfig) -> dict:
         "num_samples": int(x.shape[0]),
         "num_classes": int(y.shape[1]),
         "loss": total_loss / max(1, n_samples),
+        "threshold": float(cfg.threshold),
         "macro_auroc": auc.macro,
         "per_class_auroc": auc.per_class,
+        "macro_accuracy": _macro_metric(per_class_cls, "accuracy"),
+        "macro_f1": _macro_metric(per_class_cls, "f1"),
+        "macro_sensitivity": _macro_metric(per_class_cls, "sensitivity"),
+        "any_class_metrics": any_metrics,
+        "per_class_classification": per_class_cls,
     }
 
-    print(
-        f"[eval] loss={metrics['loss']:.5f} macro_auroc={metrics['macro_auroc']:.5f} "
-        f"samples={metrics['num_samples']}"
-    )
+    if any_metrics is None:
+        print(
+            f"[eval] loss={metrics['loss']:.5f} macro_auroc={metrics['macro_auroc']:.5f} "
+            f"macro_acc={metrics['macro_accuracy']:.5f} macro_f1={metrics['macro_f1']:.5f} "
+            f"macro_sens={metrics['macro_sensitivity']:.5f} threshold={cfg.threshold:.2f} "
+            f"samples={metrics['num_samples']}"
+        )
+    else:
+        print(
+            f"[eval] loss={metrics['loss']:.5f} macro_auroc={metrics['macro_auroc']:.5f} "
+            f"any_acc={any_metrics['accuracy']:.5f} any_f1={any_metrics['f1']:.5f} "
+            f"any_sens={any_metrics['sensitivity']:.5f} threshold={cfg.threshold:.2f} "
+            f"samples={metrics['num_samples']}"
+        )
     if cfg.output_json:
         output_json = Path(cfg.output_json)
         output_json.parent.mkdir(parents=True, exist_ok=True)

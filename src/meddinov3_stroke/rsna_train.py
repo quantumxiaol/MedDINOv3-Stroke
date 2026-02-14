@@ -45,6 +45,7 @@ class RSNATrainPipelineConfig:
     weight_decay: float
     hidden_dim: int
     dropout: float
+    eval_threshold: float
     skip_invalid_nifti: bool
 
 
@@ -73,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=TRAIN_DEFAULTS.weight_decay)
     parser.add_argument("--hidden-dim", type=int, default=TRAIN_DEFAULTS.hidden_dim)
     parser.add_argument("--dropout", type=float, default=TRAIN_DEFAULTS.dropout)
+    parser.add_argument("--eval-threshold", type=float, default=0.5, help="Binary threshold for test metrics.")
     parser.add_argument(
         "--skip-invalid-nifti",
         action="store_true",
@@ -104,6 +106,7 @@ def parse_args(argv: list[str] | None = None) -> RSNATrainPipelineConfig:
         weight_decay=args.weight_decay,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        eval_threshold=args.eval_threshold,
         skip_invalid_nifti=args.skip_invalid_nifti,
     )
 
@@ -122,6 +125,8 @@ def _validate(cfg: RSNATrainPipelineConfig) -> None:
         raise SystemExit("resize must be > 0")
     if cfg.hidden_dim < 0:
         raise SystemExit("hidden_dim must be >= 0")
+    if not (0.0 <= cfg.eval_threshold <= 1.0):
+        raise SystemExit("eval-threshold must be in [0, 1]")
 
 
 def _save_arrays(root: Path, split_name: str, x: np.ndarray, y: np.ndarray) -> tuple[str, str]:
@@ -248,6 +253,7 @@ def run_pipeline(cfg: RSNATrainPipelineConfig) -> dict:
         device=cfg.device,
         output_json=str(output_dir / "test_metrics.json"),
         output_probs=str(output_dir / "test_probs.npy"),
+        threshold=cfg.eval_threshold,
     )
     test_metrics = evaluate_head(eval_cfg)
 

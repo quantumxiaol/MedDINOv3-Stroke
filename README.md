@@ -36,7 +36,7 @@
 训练目标：
 - `BCEWithLogitsLoss(pos_weight=...)`（多标签）
 - 默认优化器：`AdamW`
-- 评估指标：`macro AUROC` + `per-class AUROC`
+- 评估指标：`macro/per-class AUROC` + 阈值化(`pred_prob > threshold`)后的 Accuracy/F1/Sensitivity
 
 说明：
 - 当 `--hidden-dim <= 0` 时，退化为单层线性头 `Linear(768 -> C)`
@@ -204,12 +204,13 @@ python script/test_meddinov3_head.py \
   --embeddings outputs/test/meddinov3_slice_embeddings.npy \
   --labels outputs/test/slice_labels.npy \
   --checkpoint checkpoints/head_train/best.pt \
+  --threshold 0.5 \
   --output-json outputs/head_eval/metrics.json \
   --output-probs outputs/head_eval/probs.npy
 ```
 
 输出：
-- `outputs/head_eval/metrics.json`：loss、macro AUROC、per-class AUROC
+- `outputs/head_eval/metrics.json`：loss、macro/per-class AUROC、threshold=0.5 下的 Accuracy/F1/Sensitivity
 - `outputs/head_eval/probs.npy`：每样本每类别概率
 
 ### 4) RSNA 一体化训练（推荐）
@@ -225,6 +226,7 @@ python script/train_meddinov3_rsna.py \
   --pool-mode mean \
   --batch 8 --resize 224 \
   --epochs 30 --train-batch-size 64 \
+  --eval-threshold 0.5 \
   --skip-invalid-nifti
 ```
 
